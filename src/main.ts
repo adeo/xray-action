@@ -15,9 +15,14 @@ async function run(): Promise<void> {
       testExecutionJsonInput
     )
 
+    // xray cloud or server
+    const xrayBaseUrl: string = core.getInput('xrayBaseUrl')
+    const xrayServer: boolean = core.getInput('xrayServer') === 'true'
+
     // credentials for xray
     const username: string = core.getInput('username')
     const password: string = core.getInput('password')
+    core.setSecret(password)
 
     // params for xray
     const testPaths: string = core.getInput('testPaths')
@@ -41,6 +46,8 @@ async function run(): Promise<void> {
 
     await new Processor(
       {
+        xrayServer,
+        xrayBaseUrl,
         username,
         password
       },

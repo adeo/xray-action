@@ -5,6 +5,8 @@ import * as fs from 'fs'
 import {Xray} from './xray'
 
 export interface XrayOptions {
+  xrayServer: boolean
+  xrayBaseUrl: string
   username: string
   password: string
 }

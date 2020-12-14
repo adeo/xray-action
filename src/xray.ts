@@ -1,19 +1,36 @@
 import {XrayOptions, XrayImportOptions} from './processor'
-import got from 'got'
+import got, {Got} from 'got'
 import * as core from '@actions/core'
 import FormData from 'form-data'
-import {doFormDataRequest} from './utils'
 
 export class Xray {
   xrayProtocol = 'https'
-  xrayBaseUrl = 'xray.cloud.xpand-it.com'
   searchParams!: URLSearchParams
   token = ''
+  gotClient: Got
 
   constructor(
     private xrayOptions: XrayOptions,
     private xrayImportOptions: XrayImportOptions
   ) {
+    this.gotClient = got.extend({
+      responseType: 'json',
+      timeout: 30000, // 30s timeout
+      retry: 2, // retry count for some requests
+      http2: true // try to allow http2 requests
+    })
+    // xray cloud / server
+    if (this.xrayOptions.xrayServer) {
+      this.gotClient = this.gotClient.extend({
+        prefixUrl: `${this.xrayProtocol}://${this.xrayOptions.xrayBaseUrl}/rest/raven/1.0`,
+        username: this.xrayOptions.username,
+        password: this.xrayOptions.password
+      })
+    } else {
+      this.gotClient = this.gotClient.extend({
+        prefixUrl: `${this.xrayProtocol}://xray.cloud.xpand-it.com/api/v1`
+      })
+    }
     this.createSearchParams()
   }
 
@@ -88,21 +105,27 @@ export class Xray {
   }
 
   async auth(): Promise<void> {
-    const authenticateResponse = await got.post<string>(
-      `${this.xrayProtocol}://${this.xrayBaseUrl}/api/v1/authenticate`,
-      {
-        json: {
-          client_id: `${this.xrayOptions.username}`,
-          client_secret: `${this.xrayOptions.password}`
-        },
-        responseType: 'json',
-        timeout: 30000, // 30s timeout
-        retry: 2, // retry count for some requests
-        http2: true // try to allow http2 requests
-      }
-    )
-    this.token = authenticateResponse.body
-    core.setSecret(this.token)
+    if (this.xrayOptions.xrayServer) {
+      // Trying to connect to Jira server to validate auth
+      await this.gotClient.get<string>(`/api/2/myself`, {
+        prefixUrl: `${this.xrayProtocol}://${this.xrayOptions.xrayBaseUrl}`
+      })
+    } else {
+      const authenticateResponse = await this.gotClient.post<string>(
+        `/authenticate`,
+        {
+          json: {
+            client_id: `${this.xrayOptions.username}`,
+            client_secret: `${this.xrayOptions.password}`
+          }
+        }
+      )
+      const token = authenticateResponse.body
+      this.gotClient = this.gotClient.extend({
+        headers: {Authorization: `Bearer ${token}`}
+      })
+      core.setSecret(token)
+    }
   }
 
   async import(data: Buffer): Promise<string> {
@@ -148,40 +171,40 @@ export class Xray {
         }
       )
 
+      const endpoint = `/import/execution/${format}/multipart`
       core.debug(
-        `Using multipart endpoint: ${this.xrayProtocol}://${this.xrayBaseUrl}/api/v1/import/execution/${format}/multipart`
+        `Using multipart endpoint: ${this.gotClient.defaults.options.prefixUrl}${endpoint}`
       )
-      const importResponse = await doFormDataRequest(form, {
-        host: this.xrayBaseUrl,
-        path: `/api/v1/import/execution/${format}/multipart`,
-        headers: {Authorization: `Bearer ${this.token}`}
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const importResponse = await this.gotClient.post<any>(endpoint, {
+        body: form
       })
+
       try {
-        return importResponse.key
+        return importResponse.body.key
       } catch (error) {
         core.warning(
           `🔥 Response did not match expected format: ${JSON.stringify(
-            importResponse
+            importResponse.body
           )}`
         )
         return ''
       }
     } else {
-      const endpoint = `${this.xrayProtocol}://${this.xrayBaseUrl}/api/v1/import/execution/${format}`
-      core.debug(`Using endpoint: ${endpoint}`)
+      const endpoint = `/import/execution/${format}`
+      core.debug(
+        `Using endpoint: ${this.gotClient.defaults.options.prefixUrl}${endpoint}`
+      )
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const importResponse = await got.post<any>(endpoint, {
+      const importResponse = await this.gotClient.post<any>(endpoint, {
         searchParams: this.searchParams,
         headers: {
-          'Content-Type': 'text/xml',
-          Authorization: `Bearer ${this.token}`
+          'Content-Type': 'text/xml'
         },
         body: data,
-        responseType: 'json',
-        timeout: 60000, // 60s timeout
-        retry: 2, // retry count for some requests
-        http2: true // try to allow http2 requests
+        timeout: 60000 // 60s timeout
       })
       try {
         return importResponse.body.key

@@ -48,9 +48,13 @@ function run() {
             // read in test exec config file if possible
             const testExecutionJsonInput = core.getInput('testExecutionJson');
             const testExecutionJson = utils_1.resolveJson(repositoryPath, testExecutionJsonInput);
+            // xray cloud or server
+            const xrayBaseUrl = core.getInput('xrayBaseUrl');
+            const xrayServer = core.getInput('xrayServer') === 'true';
             // credentials for xray
             const username = core.getInput('username');
             const password = core.getInput('password');
+            core.setSecret(password);
             // params for xray
             const testPaths = core.getInput('testPaths');
             const testFormat = core.getInput('testFormat');
@@ -66,6 +70,8 @@ function run() {
             const continueOnImportError = core.getInput('continueOnImportError') === 'true';
             const importParallelism = Number(core.getInput('importParallelism')) || 2; // by default go to 2 parallelism
             yield new processor_1.Processor({
+                xrayServer,
+                xrayBaseUrl,
                 username,
                 password
             }, {
@@ -374,14 +380,31 @@ exports.Xray = void 0;
 const got_1 = __importDefault(__webpack_require__(3061));
 const core = __importStar(__webpack_require__(2186));
 const form_data_1 = __importDefault(__webpack_require__(4334));
-const utils_1 = __webpack_require__(918);
 class Xray {
     constructor(xrayOptions, xrayImportOptions) {
         this.xrayOptions = xrayOptions;
         this.xrayImportOptions = xrayImportOptions;
         this.xrayProtocol = 'https';
-        this.xrayBaseUrl = 'xray.cloud.xpand-it.com';
         this.token = '';
+        this.gotClient = got_1.default.extend({
+            responseType: 'json',
+            timeout: 30000,
+            retry: 2,
+            http2: true // try to allow http2 requests
+        });
+        // xray cloud / server
+        if (this.xrayOptions.xrayServer) {
+            this.gotClient = this.gotClient.extend({
+                prefixUrl: `${this.xrayProtocol}://${this.xrayOptions.xrayBaseUrl}/rest/raven/1.0`,
+                username: this.xrayOptions.username,
+                password: this.xrayOptions.password
+            });
+        }
+        else {
+            this.gotClient = this.gotClient.extend({
+                prefixUrl: `${this.xrayProtocol}://xray.cloud.xpand-it.com/api/v1`
+            });
+        }
         this.createSearchParams();
     }
     updateTestExecKey(testExecKey) {
@@ -444,18 +467,25 @@ class Xray {
     }
     auth() {
         return __awaiter(this, void 0, void 0, function* () {
-            const authenticateResponse = yield got_1.default.post(`${this.xrayProtocol}://${this.xrayBaseUrl}/api/v1/authenticate`, {
-                json: {
-                    client_id: `${this.xrayOptions.username}`,
-                    client_secret: `${this.xrayOptions.password}`
-                },
-                responseType: 'json',
-                timeout: 30000,
-                retry: 2,
-                http2: true // try to allow http2 requests
-            });
-            this.token = authenticateResponse.body;
-            core.setSecret(this.token);
+            if (this.xrayOptions.xrayServer) {
+                // Trying to connect to Jira server to validate auth
+                yield this.gotClient.get(`/api/2/myself`, {
+                    prefixUrl: `${this.xrayProtocol}://${this.xrayOptions.xrayBaseUrl}`
+                });
+            }
+            else {
+                const authenticateResponse = yield this.gotClient.post(`/authenticate`, {
+                    json: {
+                        client_id: `${this.xrayOptions.username}`,
+                        client_secret: `${this.xrayOptions.password}`
+                    }
+                });
+                const token = authenticateResponse.body;
+                this.gotClient = this.gotClient.extend({
+                    headers: { Authorization: `Bearer ${token}` }
+                });
+                core.setSecret(token);
+            }
         });
     }
     import(data) {
@@ -490,35 +520,31 @@ class Xray {
                     filename: 'testInfo.json',
                     filepath: 'testInfo.json'
                 });
-                core.debug(`Using multipart endpoint: ${this.xrayProtocol}://${this.xrayBaseUrl}/api/v1/import/execution/${format}/multipart`);
-                const importResponse = yield utils_1.doFormDataRequest(form, {
-                    host: this.xrayBaseUrl,
-                    path: `/api/v1/import/execution/${format}/multipart`,
-                    headers: { Authorization: `Bearer ${this.token}` }
+                const endpoint = `/import/execution/${format}/multipart`;
+                core.debug(`Using multipart endpoint: ${this.gotClient.defaults.options.prefixUrl}${endpoint}`);
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const importResponse = yield this.gotClient.post(endpoint, {
+                    body: form
                 });
                 try {
-                    return importResponse.key;
+                    return importResponse.body.key;
                 }
                 catch (error) {
-                    core.warning(`🔥 Response did not match expected format: ${JSON.stringify(importResponse)}`);
+                    core.warning(`🔥 Response did not match expected format: ${JSON.stringify(importResponse.body)}`);
                     return '';
                 }
             }
             else {
-                const endpoint = `${this.xrayProtocol}://${this.xrayBaseUrl}/api/v1/import/execution/${format}`;
-                core.debug(`Using endpoint: ${endpoint}`);
+                const endpoint = `/import/execution/${format}`;
+                core.debug(`Using endpoint: ${this.gotClient.defaults.options.prefixUrl}${endpoint}`);
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                const importResponse = yield got_1.default.post(endpoint, {
+                const importResponse = yield this.gotClient.post(endpoint, {
                     searchParams: this.searchParams,
                     headers: {
-                        'Content-Type': 'text/xml',
-                        Authorization: `Bearer ${this.token}`
+                        'Content-Type': 'text/xml'
                     },
                     body: data,
-                    responseType: 'json',
-                    timeout: 60000,
-                    retry: 2,
-                    http2: true // try to allow http2 requests
+                    timeout: 60000 // 60s timeout
                 });
                 try {
                     return importResponse.body.key;
@@ -962,12 +988,19 @@ exports.create = create;
 /***/ }),
 
 /***/ 1026:
-/***/ ((__unused_webpack_module, exports, __webpack_require__) => {
+/***/ (function(__unused_webpack_module, exports, __webpack_require__) {
 
 "use strict";
 
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (Object.hasOwnProperty.call(mod, k)) result[k] = mod[k];
+    result["default"] = mod;
+    return result;
+};
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-const core = __webpack_require__(2186);
+const core = __importStar(__webpack_require__(2186));
 /**
  * Returns a copy with defaults filled in.
  */
@@ -1031,12 +1064,19 @@ var __asyncGenerator = (this && this.__asyncGenerator) || function (thisArg, _ar
     function reject(value) { resume("throw", value); }
     function settle(f, v) { if (f(v), q.shift(), q.length) resume(q[0][0], q[0][1]); }
 };
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (Object.hasOwnProperty.call(mod, k)) result[k] = mod[k];
+    result["default"] = mod;
+    return result;
+};
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-const core = __webpack_require__(2186);
-const fs = __webpack_require__(5747);
-const globOptionsHelper = __webpack_require__(1026);
-const path = __webpack_require__(5622);
-const patternHelper = __webpack_require__(9005);
+const core = __importStar(__webpack_require__(2186));
+const fs = __importStar(__webpack_require__(5747));
+const globOptionsHelper = __importStar(__webpack_require__(1026));
+const path = __importStar(__webpack_require__(5622));
+const patternHelper = __importStar(__webpack_require__(9005));
 const internal_match_kind_1 = __webpack_require__(1063);
 const internal_pattern_1 = __webpack_require__(4536);
 const internal_search_state_1 = __webpack_require__(9117);
@@ -1245,13 +1285,23 @@ var MatchKind;
 /***/ }),
 
 /***/ 1849:
-/***/ ((__unused_webpack_module, exports, __webpack_require__) => {
+/***/ (function(__unused_webpack_module, exports, __webpack_require__) {
 
 "use strict";
 
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (Object.hasOwnProperty.call(mod, k)) result[k] = mod[k];
+    result["default"] = mod;
+    return result;
+};
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-const assert = __webpack_require__(2357);
-const path = __webpack_require__(5622);
+const path = __importStar(__webpack_require__(5622));
+const assert_1 = __importDefault(__webpack_require__(2357));
 const IS_WINDOWS = process.platform === 'win32';
 /**
  * Similar to path.dirname except normalizes the path separators and slightly better handling for Windows UNC paths.
@@ -1291,8 +1341,8 @@ exports.dirname = dirname;
  * or `C:` are expanded based on the current working directory.
  */
 function ensureAbsoluteRoot(root, itemPath) {
-    assert(root, `ensureAbsoluteRoot parameter 'root' must not be empty`);
-    assert(itemPath, `ensureAbsoluteRoot parameter 'itemPath' must not be empty`);
+    assert_1.default(root, `ensureAbsoluteRoot parameter 'root' must not be empty`);
+    assert_1.default(itemPath, `ensureAbsoluteRoot parameter 'itemPath' must not be empty`);
     // Already rooted
     if (hasAbsoluteRoot(itemPath)) {
         return itemPath;
@@ -1302,7 +1352,7 @@ function ensureAbsoluteRoot(root, itemPath) {
         // Check for itemPath like C: or C:foo
         if (itemPath.match(/^[A-Z]:[^\\/]|^[A-Z]:$/i)) {
             let cwd = process.cwd();
-            assert(cwd.match(/^[A-Z]:\\/i), `Expected current directory to start with an absolute drive root. Actual '${cwd}'`);
+            assert_1.default(cwd.match(/^[A-Z]:\\/i), `Expected current directory to start with an absolute drive root. Actual '${cwd}'`);
             // Drive letter matches cwd? Expand to cwd
             if (itemPath[0].toUpperCase() === cwd[0].toUpperCase()) {
                 // Drive only, e.g. C:
@@ -1327,11 +1377,11 @@ function ensureAbsoluteRoot(root, itemPath) {
         // Check for itemPath like \ or \foo
         else if (normalizeSeparators(itemPath).match(/^\\$|^\\[^\\]/)) {
             const cwd = process.cwd();
-            assert(cwd.match(/^[A-Z]:\\/i), `Expected current directory to start with an absolute drive root. Actual '${cwd}'`);
+            assert_1.default(cwd.match(/^[A-Z]:\\/i), `Expected current directory to start with an absolute drive root. Actual '${cwd}'`);
             return `${cwd[0]}:\\${itemPath.substr(1)}`;
         }
     }
-    assert(hasAbsoluteRoot(root), `ensureAbsoluteRoot parameter 'root' must have an absolute root`);
+    assert_1.default(hasAbsoluteRoot(root), `ensureAbsoluteRoot parameter 'root' must have an absolute root`);
     // Otherwise ensure root ends with a separator
     if (root.endsWith('/') || (IS_WINDOWS && root.endsWith('\\'))) {
         // Intentionally empty
@@ -1348,7 +1398,7 @@ exports.ensureAbsoluteRoot = ensureAbsoluteRoot;
  * `\\hello\share` and `C:\hello` (and using alternate separator).
  */
 function hasAbsoluteRoot(itemPath) {
-    assert(itemPath, `hasAbsoluteRoot parameter 'itemPath' must not be empty`);
+    assert_1.default(itemPath, `hasAbsoluteRoot parameter 'itemPath' must not be empty`);
     // Normalize separators
     itemPath = normalizeSeparators(itemPath);
     // Windows
@@ -1365,7 +1415,7 @@ exports.hasAbsoluteRoot = hasAbsoluteRoot;
  * `\`, `\hello`, `\\hello\share`, `C:`, and `C:\hello` (and using alternate separator).
  */
 function hasRoot(itemPath) {
-    assert(itemPath, `isRooted parameter 'itemPath' must not be empty`);
+    assert_1.default(itemPath, `isRooted parameter 'itemPath' must not be empty`);
     // Normalize separators
     itemPath = normalizeSeparators(itemPath);
     // Windows
@@ -1427,14 +1477,24 @@ exports.safeTrimTrailingSeparator = safeTrimTrailingSeparator;
 /***/ }),
 
 /***/ 6836:
-/***/ ((__unused_webpack_module, exports, __webpack_require__) => {
+/***/ (function(__unused_webpack_module, exports, __webpack_require__) {
 
 "use strict";
 
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (Object.hasOwnProperty.call(mod, k)) result[k] = mod[k];
+    result["default"] = mod;
+    return result;
+};
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-const assert = __webpack_require__(2357);
-const path = __webpack_require__(5622);
-const pathHelper = __webpack_require__(1849);
+const path = __importStar(__webpack_require__(5622));
+const pathHelper = __importStar(__webpack_require__(1849));
+const assert_1 = __importDefault(__webpack_require__(2357));
 const IS_WINDOWS = process.platform === 'win32';
 /**
  * Helper class for parsing paths into segments
@@ -1448,7 +1508,7 @@ class Path {
         this.segments = [];
         // String
         if (typeof itemPath === 'string') {
-            assert(itemPath, `Parameter 'itemPath' must not be empty`);
+            assert_1.default(itemPath, `Parameter 'itemPath' must not be empty`);
             // Normalize slashes and trim unnecessary trailing slash
             itemPath = pathHelper.safeTrimTrailingSeparator(itemPath);
             // Not rooted
@@ -1475,24 +1535,24 @@ class Path {
         // Array
         else {
             // Must not be empty
-            assert(itemPath.length > 0, `Parameter 'itemPath' must not be an empty array`);
+            assert_1.default(itemPath.length > 0, `Parameter 'itemPath' must not be an empty array`);
             // Each segment
             for (let i = 0; i < itemPath.length; i++) {
                 let segment = itemPath[i];
                 // Must not be empty
-                assert(segment, `Parameter 'itemPath' must not contain any empty segments`);
+                assert_1.default(segment, `Parameter 'itemPath' must not contain any empty segments`);
                 // Normalize slashes
                 segment = pathHelper.normalizeSeparators(itemPath[i]);
                 // Root segment
                 if (i === 0 && pathHelper.hasRoot(segment)) {
                     segment = pathHelper.safeTrimTrailingSeparator(segment);
-                    assert(segment === pathHelper.dirname(segment), `Parameter 'itemPath' root segment contains information for multiple segments`);
+                    assert_1.default(segment === pathHelper.dirname(segment), `Parameter 'itemPath' root segment contains information for multiple segments`);
                     this.segments.push(segment);
                 }
                 // All other segments
                 else {
                     // Must not contain slash
-                    assert(!segment.includes(path.sep), `Parameter 'itemPath' contains unexpected path separators`);
+                    assert_1.default(!segment.includes(path.sep), `Parameter 'itemPath' contains unexpected path separators`);
                     this.segments.push(segment);
                 }
             }
@@ -1524,12 +1584,19 @@ exports.Path = Path;
 /***/ }),
 
 /***/ 9005:
-/***/ ((__unused_webpack_module, exports, __webpack_require__) => {
+/***/ (function(__unused_webpack_module, exports, __webpack_require__) {
 
 "use strict";
 
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (Object.hasOwnProperty.call(mod, k)) result[k] = mod[k];
+    result["default"] = mod;
+    return result;
+};
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-const pathHelper = __webpack_require__(1849);
+const pathHelper = __importStar(__webpack_require__(1849));
 const internal_match_kind_1 = __webpack_require__(1063);
 const IS_WINDOWS = process.platform === 'win32';
 /**
@@ -1605,21 +1672,31 @@ exports.partialMatch = partialMatch;
 /***/ }),
 
 /***/ 4536:
-/***/ ((__unused_webpack_module, exports, __webpack_require__) => {
+/***/ (function(__unused_webpack_module, exports, __webpack_require__) {
 
 "use strict";
 
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (Object.hasOwnProperty.call(mod, k)) result[k] = mod[k];
+    result["default"] = mod;
+    return result;
+};
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-const assert = __webpack_require__(2357);
-const os = __webpack_require__(2087);
-const path = __webpack_require__(5622);
-const pathHelper = __webpack_require__(1849);
+const os = __importStar(__webpack_require__(2087));
+const path = __importStar(__webpack_require__(5622));
+const pathHelper = __importStar(__webpack_require__(1849));
+const assert_1 = __importDefault(__webpack_require__(2357));
 const minimatch_1 = __webpack_require__(3973);
 const internal_match_kind_1 = __webpack_require__(1063);
 const internal_path_1 = __webpack_require__(6836);
 const IS_WINDOWS = process.platform === 'win32';
 class Pattern {
-    constructor(patternOrNegate, segments) {
+    constructor(patternOrNegate, segments, homedir) {
         /**
          * Indicates whether matches should be excluded from the result set
          */
@@ -1633,9 +1710,9 @@ class Pattern {
         else {
             // Convert to pattern
             segments = segments || [];
-            assert(segments.length, `Parameter 'segments' must not empty`);
+            assert_1.default(segments.length, `Parameter 'segments' must not empty`);
             const root = Pattern.getLiteral(segments[0]);
-            assert(root && pathHelper.hasAbsoluteRoot(root), `Parameter 'segments' first element must be a root path`);
+            assert_1.default(root && pathHelper.hasAbsoluteRoot(root), `Parameter 'segments' first element must be a root path`);
             pattern = new internal_path_1.Path(segments).toString().trim();
             if (patternOrNegate) {
                 pattern = `!${pattern}`;
@@ -1647,7 +1724,7 @@ class Pattern {
             pattern = pattern.substr(1).trim();
         }
         // Normalize slashes and ensures absolute root
-        pattern = Pattern.fixupPattern(pattern);
+        pattern = Pattern.fixupPattern(pattern, homedir);
         // Segments
         this.segments = new internal_path_1.Path(pattern).segments;
         // Trailing slash indicates the pattern should only match directories, not regular files
@@ -1684,11 +1761,11 @@ class Pattern {
             // Normalize slashes
             itemPath = pathHelper.normalizeSeparators(itemPath);
             // Append a trailing slash. Otherwise Minimatch will not match the directory immediately
-            // preceeding the globstar. For example, given the pattern `/foo/**`, Minimatch returns
+            // preceding the globstar. For example, given the pattern `/foo/**`, Minimatch returns
             // false for `/foo` but returns true for `/foo/`. Append a trailing slash to handle that quirk.
             if (!itemPath.endsWith(path.sep)) {
                 // Note, this is safe because the constructor ensures the pattern has an absolute root.
-                // For example, formats like C: and C:foo on Windows are resolved to an aboslute root.
+                // For example, formats like C: and C:foo on Windows are resolved to an absolute root.
                 itemPath = `${itemPath}${path.sep}`;
             }
         }
@@ -1726,15 +1803,15 @@ class Pattern {
     /**
      * Normalizes slashes and ensures absolute root
      */
-    static fixupPattern(pattern) {
+    static fixupPattern(pattern, homedir) {
         // Empty
-        assert(pattern, 'pattern cannot be empty');
+        assert_1.default(pattern, 'pattern cannot be empty');
         // Must not contain `.` segment, unless first segment
         // Must not contain `..` segment
         const literalSegments = new internal_path_1.Path(pattern).segments.map(x => Pattern.getLiteral(x));
-        assert(literalSegments.every((x, i) => (x !== '.' || i === 0) && x !== '..'), `Invalid pattern '${pattern}'. Relative pathing '.' and '..' is not allowed.`);
+        assert_1.default(literalSegments.every((x, i) => (x !== '.' || i === 0) && x !== '..'), `Invalid pattern '${pattern}'. Relative pathing '.' and '..' is not allowed.`);
         // Must not contain globs in root, e.g. Windows UNC path \\foo\b*r
-        assert(!pathHelper.hasRoot(pattern) || literalSegments[0], `Invalid pattern '${pattern}'. Root segment must not contain globs.`);
+        assert_1.default(!pathHelper.hasRoot(pattern) || literalSegments[0], `Invalid pattern '${pattern}'. Root segment must not contain globs.`);
         // Normalize slashes
         pattern = pathHelper.normalizeSeparators(pattern);
         // Replace leading `.` segment
@@ -1743,9 +1820,9 @@ class Pattern {
         }
         // Replace leading `~` segment
         else if (pattern === '~' || pattern.startsWith(`~${path.sep}`)) {
-            const homedir = os.homedir();
-            assert(homedir, 'Unable to determine HOME directory');
-            assert(pathHelper.hasAbsoluteRoot(homedir), `Expected HOME directory to be a rooted path. Actual '${homedir}'`);
+            homedir = homedir || os.homedir();
+            assert_1.default(homedir, 'Unable to determine HOME directory');
+            assert_1.default(pathHelper.hasAbsoluteRoot(homedir), `Expected HOME directory to be a rooted path. Actual '${homedir}'`);
             pattern = Pattern.globEscape(homedir) + pattern.substr(1);
         }
         // Replace relative drive root, e.g. pattern is C: or C:foo
@@ -3926,7 +4003,11 @@ class CacheableLookup {
 				const newPromise = this.queryAndCache(hostname);
 				this._pending[hostname] = newPromise;
 
-				cached = await newPromise;
+				try {
+					cached = await newPromise;
+				} finally {
+					delete this._pending[hostname];
+				}
 			}
 		}
 
@@ -4040,29 +4121,21 @@ class CacheableLookup {
 			return this._dnsLookup(hostname, all);
 		}
 
-		try {
-			let query = await this._resolve(hostname);
+		let query = await this._resolve(hostname);
 
-			if (query.entries.length === 0 && this._fallback) {
-				query = await this._lookup(hostname);
+		if (query.entries.length === 0 && this._fallback) {
+			query = await this._lookup(hostname);
 
-				if (query.entries.length !== 0) {
-					// Use `dns.lookup(...)` for that particular hostname
-					this._hostnamesToFallback.add(hostname);
-				}
+			if (query.entries.length !== 0) {
+				// Use `dns.lookup(...)` for that particular hostname
+				this._hostnamesToFallback.add(hostname);
 			}
-
-			const cacheTtl = query.entries.length === 0 ? this.errorTtl : query.cacheTtl;
-			await this._set(hostname, query.entries, cacheTtl);
-
-			delete this._pending[hostname];
-
-			return query.entries;
-		} catch (error) {
-			delete this._pending[hostname];
-
-			throw error;
 		}
+
+		const cacheTtl = query.entries.length === 0 ? this.errorTtl : query.cacheTtl;
+		await this._set(hostname, query.entries, cacheTtl);
+
+		return query.entries;
 	}
 
 	_tick(ms) {
@@ -6329,7 +6402,7 @@ class RequestError extends Error {
         }
         this.timings = (_a = this.request) === null || _a === void 0 ? void 0 : _a.timings;
         // Recover the original stacktrace
-        if (!is_1.default.undefined(error.stack)) {
+        if (is_1.default.string(error.stack) && is_1.default.string(this.stack)) {
             const indexOfMessage = this.stack.indexOf(this.message) + this.message.length;
             const thisStackTrace = this.stack.slice(indexOfMessage).split('\n').reverse();
             const errorStackTrace = error.stack.slice(error.stack.indexOf(error.message) + error.message.length).split('\n').reverse();
